@@ -1,0 +1,8 @@
+aws_region           = "us-east-1"
+project_name         = "data-pipeline"
+environment          = "dev"
+bucket_name          = "my-data-pipeline-uploads"
+instance_type        = "t3.nano"
+asg_desired_capacity = 5
+asg_min_size         = 1
+asg_max_size         = 5

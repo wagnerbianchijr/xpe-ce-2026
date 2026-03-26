@@ -1,0 +1,120 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - sudo
+  - apt-transport-https
+  - software-properties-common
+
+write_files:
+  - path: /usr/local/bin/bootstrap-pg18-timescale-docker.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuxo pipefail
+      exec > >(tee -a /var/log/bootstrap-pg18-timescale-docker.log) 2>&1
+
+      export DEBIAN_FRONTEND=noninteractive
+
+      ADMIN_USER="azureadmin"
+      PGVER="18"
+      DBNAME="fleet_service"
+      TSDB_PKG="timescaledb-2-postgresql-18"
+      TSDB_VER_PIN="2.25.2"
+
+      . /etc/os-release
+
+      apt-get update
+
+      apt-get install -y postgresql-common
+
+      install -d /usr/share/postgresql-common/pgdg
+      curl --fail -L -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc
+
+      cat >/etc/apt/sources.list.d/pgdg.list <<EOF
+      deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main
+      EOF
+
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+
+      cat >/etc/apt/sources.list.d/docker.list <<EOF
+      deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable
+      EOF
+
+      apt-get update
+      apt-get install -y \
+        postgresql-18 \
+        postgresql-client-18 \
+        postgresql-contrib-18 \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin \
+        git
+
+      curl -fsSL https://packagecloud.io/install/repositories/timescale/timescaledb/script.deb.sh \
+        -o /tmp/timescaledb-repo.sh
+      bash /tmp/timescaledb-repo.sh
+
+      apt-get update
+
+      TSDB_VER="$(apt-cache madison "${TSDB_PKG}" | awk '{print $3}' | grep "^${TSDB_VER_PIN}" | head -n1)"
+      if [ -z "${TSDB_VER}" ]; then
+        echo "Could not find ${TSDB_PKG} version ${TSDB_VER_PIN} in APT metadata" >&2
+        exit 1
+      fi
+
+      apt-get install -y \
+        "${TSDB_PKG}=${TSDB_VER}" \
+        timescaledb-tools \
+        timescaledb-toolkit-postgresql-18
+
+      systemctl enable docker
+      systemctl restart docker
+
+      if id "${ADMIN_USER}" >/dev/null 2>&1; then
+        usermod -aG docker "${ADMIN_USER}"
+      fi
+
+      timescaledb-tune --quiet --yes
+
+      PGCONF="/etc/postgresql/${PGVER}/main/postgresql.conf"
+      PGHBA="/etc/postgresql/${PGVER}/main/pg_hba.conf"
+
+      sed -i "s/^#\?listen_addresses.*/listen_addresses = '*'/" "${PGCONF}"
+
+      grep -q "^host all all 0.0.0.0/0 scram-sha-256$" "${PGHBA}" \
+        || echo "host all all 0.0.0.0/0 scram-sha-256" >> "${PGHBA}"
+
+      grep -q "^host all all ::/0 scram-sha-256$" "${PGHBA}" \
+        || echo "host all all ::/0 scram-sha-256" >> "${PGHBA}"
+
+      systemctl enable postgresql
+      systemctl restart postgresql
+
+      su - postgres -c "psql -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname = '${DBNAME}'\"" | grep -q 1 \
+        || su - postgres -c "createdb ${DBNAME}"
+
+      su - postgres -c "psql -d ${DBNAME} -c \"CREATE EXTENSION IF NOT EXISTS timescaledb VERSION '2.25.2';\""
+      su - postgres -c "psql -d ${DBNAME} -c 'CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit;'"
+
+      docker --version
+      docker compose version
+      su - postgres -c "psql -d ${DBNAME} -c 'SELECT current_database(), version();'"
+      su - postgres -c "psql -d ${DBNAME} -c '\dx'" > /var/log/fleet_service-extensions.txt
+
+runcmd:
+  - [ bash, /usr/local/bin/bootstrap-pg18-timescale-docker.sh ]
+
+final_message: "cloud-init finished provisioning PostgreSQL 18, TimescaleDB 2.25.2, and Docker."
